@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """shazam-artist-stats — Shazam statistics for a given artist.
 
-Data source: public shazam.com pages (no API keys required):
-  * the artist page server-renders the artist's albums and singles;
-  * each album page server-renders its track list;
-  * each song page server-renders its Shazam ("tag") count.
+Shazam uses Apple's catalog ids, so the discography is enumerated through the
+public **iTunes API** (no key required), and the per-track **Shazam counts**
+are read from the public song pages on shazam.com:
 
-Artist lookup by name uses Shazam's internal amapi search endpoint with a
-token obtained dynamically (the same flow the website itself uses).
+  1. iTunes search resolves an artist name to an artist id.
+  2. iTunes lookup returns the artist's full list of releases (albums/singles).
+  3. Each Shazam album page lists its tracks (with the slugs the song pages need).
+  4. Each Shazam song page server-renders its Shazam ("tag") count.
 
 Examples:
     python shazam_stats.py "Personal Animosity"
@@ -30,19 +31,16 @@ from html import unescape
 from typing import Optional
 
 BASE = "https://www.shazam.com"
-TOKEN_URL = BASE + "/services/partner/oauth/commerce/validate"
-SEARCH_URL = BASE + "/services/amapi/v1/catalog/{country}/search"
+ITUNES = "https://itunes.apple.com/{op}"
 
 UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
       "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1")
 
-# Links found on artist / album pages.
+# /song/<id>/<slug> links found on Shazam album pages.
 SONG_LINK_RE = re.compile(r'/song/(\d+)/([a-z0-9][a-z0-9-]*)')
-ALBUM_LINK_RE = re.compile(r'/album/(\d+)/([a-z0-9][a-z0-9-]*)')
 # Shazam count on a song page: <span class="...tagCountText...">123</span>
 COUNT_RE = re.compile(r'tagCountText[^"]*">\s*([\d,]+)\s*<')
 TITLE_RE = re.compile(r'<title>([^<]+)</title>', re.I)
-OG_TITLE_RE = re.compile(r'<meta\s+property="og:title"\s+content="([^"]+)"', re.I)
 
 
 class ShazamError(Exception):
@@ -69,17 +67,13 @@ class ArtistStats:
 # --------------------------------------------------------------------------- #
 # HTTP
 # --------------------------------------------------------------------------- #
-def _request(url: str, *, token: Optional[str] = None) -> str:
-    headers = {
+def _get(url: str) -> str:
+    req = urllib.request.Request(url, headers={
         "User-Agent": UA,
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, identity",
-        "Origin": BASE,
-    }
-    if token:
-        headers["Authorization"] = "Bearer " + token
-    req = urllib.request.Request(url, headers=headers)
+    })
     try:
         resp = urllib.request.urlopen(req, timeout=30)
     except urllib.error.HTTPError as e:
@@ -92,86 +86,60 @@ def _request(url: str, *, token: Optional[str] = None) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
-def get_token() -> str:
-    """Dynamic developer token (the x-shz-validation response header)."""
-    headers = {"User-Agent": UA, "Accept": "*/*", "Origin": BASE}
-    req = urllib.request.Request(TOKEN_URL, headers=headers)
+def _itunes(op: str, params: dict) -> dict:
+    url = ITUNES.format(op=op) + "?" + urllib.parse.urlencode(params)
+    body = _get(url)
     try:
-        resp = urllib.request.urlopen(req, timeout=30)
-    except (urllib.error.HTTPError, urllib.error.URLError) as e:
-        raise ShazamError(f"Could not obtain Shazam token: {e}") from e
-    token = resp.headers.get("x-shz-validation")
-    if not token:
-        raise ShazamError("Response is missing the x-shz-validation token header.")
-    return token
+        return json.loads(body)
+    except json.JSONDecodeError as e:
+        raise ShazamError(f"Could not parse iTunes response: {e}") from e
 
 
 # --------------------------------------------------------------------------- #
 # Pipeline steps
 # --------------------------------------------------------------------------- #
 def search_artist(name: str, country: str):
-    """Return matches ordered by relevance: [{'id': ..., 'name': ...}, ...]."""
-    token = get_token()
-    q = urllib.parse.urlencode({"types": "artists", "term": name, "limit": 10})
-    url = SEARCH_URL.format(country=country) + "?" + q
-    body = _request(url, token=token)
-    try:
-        data = json.loads(body)
-    except json.JSONDecodeError as e:
-        raise ShazamError(f"Could not parse search response: {e}") from e
-    items = (data.get("results", {}).get("artists", {}) or {}).get("data", []) or []
+    """Resolve an artist name to matches, ordered by relevance."""
+    data = _itunes("search", {"term": name, "entity": "musicArtist",
+                              "limit": 10, "country": country})
     out = []
-    for it in items:
-        aid = it.get("id")
-        nm = (it.get("attributes") or {}).get("name", "")
+    for r in data.get("results", []):
+        aid = r.get("artistId")
         if aid:
-            out.append({"id": str(aid), "name": nm})
+            out.append({"id": str(aid), "name": r.get("artistName", "")})
     return out
 
 
-def _collect_song_links(body: str, into: dict) -> None:
-    """Add /song/<id>/<slug> links from HTML into {id: path}, preserving order."""
+def get_artist_albums(artist_id: str, country: str):
+    """Artist name and the full list of releases: (name, [(album_id, album_name), ...])."""
+    data = _itunes("lookup", {"id": artist_id, "entity": "album",
+                              "limit": 200, "country": country})
+    name = ""
+    albums = []
+    for r in data.get("results", []):
+        if r.get("wrapperType") == "artist":
+            name = r.get("artistName", "") or name
+        elif r.get("wrapperType") == "collection":
+            cid = r.get("collectionId")
+            if cid:
+                albums.append((str(cid), r.get("collectionName", "")))
+    return name, albums
+
+
+def get_album_song_links(album_id: str):
+    """Tracks on a Shazam album page: [(song_id, path), ...] (path carries the slug)."""
+    body = _get(f"{BASE}/album/{album_id}/x")
+    songs: dict = {}
     for m in SONG_LINK_RE.finditer(body):
         sid = m.group(1)
-        if sid not in into:
-            into[sid] = f"/song/{sid}/{m.group(2)}"
-
-
-def get_artist_overview(artist_id: str):
-    """Artist page: name, album links, and any songs shown directly on it."""
-    body = _request(f"{BASE}/artist/_/{artist_id}")
-    name = ""
-    og = OG_TITLE_RE.search(body)
-    if og:
-        name = unescape(og.group(1)).replace(" - Shazam", "").strip()
-    albums = []
-    seen_alb = set()
-    for m in ALBUM_LINK_RE.finditer(body):
-        aid = m.group(1)
-        if aid not in seen_alb:
-            seen_alb.add(aid)
-            albums.append(f"/album/{aid}/{m.group(2)}")
-    songs: dict = {}
-    _collect_song_links(body, songs)  # singles / tracks shown on the artist page
-    return name, albums, songs
-
-
-def get_album_songs(album_path: str):
-    """Album name and its tracks: (album_name, {song_id: path})."""
-    body = _request(BASE + album_path)
-    album = ""
-    og = OG_TITLE_RE.search(body)
-    if og:
-        raw = unescape(og.group(1))
-        album = re.split(r"\s+-\s+album by\b", raw, maxsplit=1)[0].strip()
-    songs: dict = {}
-    _collect_song_links(body, songs)
-    return album, songs
+        if sid not in songs:
+            songs[sid] = f"/song/{sid}/{m.group(2)}"
+    return list(songs.items())
 
 
 def get_song_count(song_id: str, path: str, album: str) -> Track:
     """Track title and Shazam count from its song page."""
-    body = _request(BASE + path)
+    body = _get(BASE + path)
     count = 0
     m = COUNT_RE.search(body)
     if m:
@@ -184,24 +152,25 @@ def get_song_count(song_id: str, path: str, album: str) -> Track:
     return Track(song_id=song_id, title=title, album=album, shazam_count=count)
 
 
-def collect_stats(artist_id: str, artist_name: str, limit: int,
+def collect_stats(artist_id: str, artist_name: str, country: str, limit: int,
                   workers: int = 8, verbose: bool = True) -> ArtistStats:
     def progress(msg: str) -> None:
         if verbose:
             print(msg, file=sys.stderr, flush=True)
 
-    name, albums, direct_songs = get_artist_overview(artist_id)
+    name, albums = get_artist_albums(artist_id, country)
     artist_name = artist_name or name or artist_id
-    progress(f"Artist \"{artist_name}\": {len(albums)} albums found, collecting tracks...")
+    if not albums:
+        raise ShazamError(f"No releases found for artist {artist_id}.")
+    progress(f"Artist \"{artist_name}\": {len(albums)} releases found, collecting tracks...")
 
-    # song_id -> (path, album_name). Albums first so each track is attributed.
+    # song_id -> (path, album_name); first album that lists a track wins.
     songs: dict = {}
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        for album_name, album_songs in pool.map(get_album_songs, albums):
-            for sid, path in album_songs.items():
+        link_lists = pool.map(get_album_song_links, [cid for cid, _ in albums])
+        for (cid, album_name), links in zip(albums, link_lists):
+            for sid, path in links:
                 songs.setdefault(sid, (path, album_name))
-    for sid, path in direct_songs.items():  # singles shown on the artist page
-        songs.setdefault(sid, (path, ""))
 
     if not songs:
         raise ShazamError(f"No tracks found for artist {artist_id}.")
@@ -230,14 +199,14 @@ def render_table(stats: ArtistStats) -> str:
     def grp(n: int) -> str:  # 1234567 -> "1 234 567"
         return f"{n:,}".replace(",", " ")
 
+    def fit(s: str, w: int) -> str:
+        return (s[:w - 1] + "…") if len(s) > w else s
+
     lines = [
         f"Artist: {stats.artist_name}  (id {stats.artist_id})",
         f"Total Shazams across {stats.track_count} tracks: {grp(stats.total_shazams)}",
         "",
     ]
-    def fit(s: str, w: int) -> str:
-        return (s[:w - 1] + "…") if len(s) > w else s
-
     title_w = min(40, max([len("Track")] + [len(t.title) for t in stats.tracks]))
     album_w = min(34, max([len("Album")] + [len(t.album) for t in stats.tracks]))
     cnt_w = max([len("Shazams")] + [len(grp(t.shazam_count)) for t in stats.tracks])
@@ -261,13 +230,13 @@ def render_json(stats: ArtistStats) -> str:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         prog="shazam-stats",
-        description="Shazam statistics for an artist (source: shazam.com).",
+        description="Shazam statistics for an artist (iTunes catalog + shazam.com).",
     )
     p.add_argument("name", nargs="?", help="artist name to search for")
-    p.add_argument("--artist-id", help="exact Shazam artist id (skips name search)")
-    p.add_argument("--country", default="us", help="storefront for search (default: us)")
-    p.add_argument("--limit", type=int, default=1000,
-                   help="max number of tracks to fetch (default: 1000)")
+    p.add_argument("--artist-id", help="exact Apple/Shazam artist id (skips name search)")
+    p.add_argument("--country", default="us", help="iTunes storefront (default: us)")
+    p.add_argument("--limit", type=int, default=2000,
+                   help="max number of tracks to fetch (default: 2000)")
     p.add_argument("--json", action="store_true", help="print JSON instead of a table")
     p.add_argument("-q", "--quiet", action="store_true", help="suppress progress output")
     args = p.parse_args(argv)
@@ -299,7 +268,8 @@ def main(argv=None) -> int:
                     print(f"  --artist-id {m['id']}  {m['name']}", file=sys.stderr)
                 print("", file=sys.stderr)
 
-        stats = collect_stats(artist_id, artist_name, args.limit, verbose=not args.quiet)
+        stats = collect_stats(artist_id, artist_name, args.country, args.limit,
+                              verbose=not args.quiet)
     except ShazamError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1

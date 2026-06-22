@@ -7,35 +7,38 @@ from most to least Shazamed.
 ```
 $ python shazam_stats.py "Personal Animosity"
 Artist: PERSONAL ANIMOSITY  (id 1720235535)
-Total Shazams across 140 tracks: 815
+Total Shazams across 246 tracks: 7 540
 
-  #  Track                          Album                       Shazams
-----------------------------------------------------------------------
-  1  Arctic Neon Tides              Loprogwave                      161
-  2  Frozen Tides Over Neon Shores  Loprogwave                      151
-  3  Midnight Assembly Line         Loprogwave                      134
+  #  Track                          Album                            Shazams
+---------------------------------------------------------------------------
+  1  bloody tears (for Julia) [fea… bloody tears (for Julia) [feat…     4 567
+  2  ENOUGH                         darkside of love - Single             521
+  3  страх                          страх - Single                        365
   ...
 ```
 
 ## Why
 
-Shazam has no official public API for artist statistics. This tool reads the
-same **public pages** the shazam.com website serves and extracts the numbers
-that are already rendered there — no API key, no account, no paid service.
+Shazam has no official public API for artist statistics. This tool combines two
+public sources — no API key, no account, no paid service:
+
+- the **iTunes API** (Apple's catalog, which Shazam shares ids with) to
+  enumerate an artist's *complete* discography;
+- the public **shazam.com** song pages, which already render each track's
+  Shazam count.
 
 ## How it works
 
-1. **Resolve the artist** — by name via Shazam's internal search endpoint
-   (using a token the website itself fetches at runtime), or directly via
-   `--artist-id`.
-2. **Walk the discography** — the artist page lists their albums; each album
-   page lists its tracks.
-3. **Read each track's Shazam count** — every song page server-renders its
-   "tag count" (the number of Shazams).
+1. **Resolve the artist** — iTunes search turns a name into an artist id
+   (or pass one directly via `--artist-id`).
+2. **Walk the full discography** — iTunes lookup returns every release; each
+   Shazam album page lists its tracks (and the slugs the song pages need).
+3. **Read each track's Shazam count** — every Shazam song page server-renders
+   its "tag count" (the number of Shazams).
 4. **Aggregate** — sum the counts and sort tracks descending.
 
-All HTTP is plain `urllib` from the standard library; song pages are fetched
-concurrently with a small thread pool.
+All HTTP is plain `urllib` from the standard library; album and song pages are
+fetched concurrently with a small thread pool.
 
 ## Requirements
 
@@ -47,7 +50,7 @@ concurrently with a small thread pool.
 # By artist name (auto-selects the best match; prints other matches to stderr)
 python shazam_stats.py "Personal Animosity"
 
-# By exact Shazam artist id (skips the name search)
+# By exact Apple/Shazam artist id (skips the name search)
 python shazam_stats.py --artist-id 1720235535
 
 # Machine-readable output
@@ -62,7 +65,7 @@ python shazam_stats.py "Personal Animosity" -q
 
 ### Finding an artist id
 
-It's the last number in a Shazam artist URL:
+It's the last number in a Shazam artist URL (the same id Apple uses):
 `https://www.shazam.com/artist/personal-animosity/`**`1720235535`**
 
 ### Options
@@ -70,9 +73,9 @@ It's the last number in a Shazam artist URL:
 | Option         | Description                                            |
 | -------------- | ------------------------------------------------------ |
 | `name`         | Artist name to search for (positional, optional)       |
-| `--artist-id`  | Exact Shazam artist id; skips the name search          |
-| `--country`    | Storefront used for the name search (default: `us`)    |
-| `--limit`      | Max number of tracks to fetch (default: `1000`)        |
+| `--artist-id`  | Exact Apple/Shazam artist id; skips the name search    |
+| `--country`    | iTunes storefront for search & lookup (default: `us`)  |
+| `--limit`      | Max number of tracks to fetch (default: `2000`)        |
 | `--json`       | Print JSON instead of a table                          |
 | `-q`, `--quiet`| Suppress progress and "other matches" messages         |
 
@@ -82,14 +85,14 @@ It's the last number in a Shazam artist URL:
 {
   "artist_id": "1720235535",
   "artist_name": "PERSONAL ANIMOSITY",
-  "total_shazams": 815,
-  "track_count": 140,
+  "total_shazams": 7540,
+  "track_count": 246,
   "tracks": [
     {
-      "song_id": "1884042458",
-      "title": "Arctic Neon Tides",
-      "album": "Loprogwave",
-      "shazam_count": 161
+      "song_id": "1787392149",
+      "title": "bloody tears (for Julia) [feat. BLAZER 993]",
+      "album": "bloody tears (for Julia) [feat. BLAZER 993] - Single",
+      "shazam_count": 4567
     }
   ]
 }
@@ -97,12 +100,13 @@ It's the last number in a Shazam artist URL:
 
 ## Notes & limitations
 
-- **Unofficial source.** This relies on the structure of shazam.com pages and
-  an internal endpoint. If Shazam changes either, the tool may need updating.
-- **Coverage.** The total covers tracks reachable from the artist's albums and
-  singles as listed on their Shazam page. Tracks that don't appear there are
-  not counted.
-- **Be polite.** Stats for a large catalog mean many requests. Keep the
+- **Unofficial source.** Counts come from the structure of shazam.com song
+  pages. If Shazam changes its markup, the tool may need updating.
+- **Coverage.** The discography is enumerated from the iTunes/Apple catalog
+  for the artist id, so it includes albums, EPs, and singles — not just what
+  the Shazam artist page happens to show. A track is counted only if it also
+  has a Shazam song page.
+- **Be polite.** A full catalog means hundreds of requests. Keep the
   concurrency modest and avoid hammering the site; use `--limit` when you don't
   need the full discography.
 - For official artist analytics, use
