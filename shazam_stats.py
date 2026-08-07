@@ -22,6 +22,7 @@ import gzip
 import json
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -31,6 +32,10 @@ from html import unescape
 from typing import Optional
 
 BASE = "https://www.shazam.com"
+# Unprefixed /song/<id>/<slug> paths are served a bot interstitial (HTTP 200 with a
+# "Client Challenge" body); the locale-prefixed variants return the real pages.
+# The prefix is case-sensitive: /en-US works, /en-us is challenged.
+LOCALE = "en-US"
 ITUNES = "https://itunes.apple.com/{op}"
 
 UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
@@ -41,6 +46,8 @@ SONG_LINK_RE = re.compile(r'/song/(\d+)/([a-z0-9][a-z0-9-]*)')
 # Shazam count on a song page: <span class="...tagCountText...">123</span>
 COUNT_RE = re.compile(r'tagCountText[^"]*">\s*([\d,]+)\s*<')
 TITLE_RE = re.compile(r'<title>([^<]+)</title>', re.I)
+# The bot interstitial: a tiny JS-only page titled "Client Challenge", served with 200.
+CHALLENGE_RE = re.compile(r'<title>\s*Client Challenge\s*</title>', re.I)
 
 
 class ShazamError(Exception):
@@ -67,7 +74,20 @@ class ArtistStats:
 # --------------------------------------------------------------------------- #
 # HTTP
 # --------------------------------------------------------------------------- #
-def _get(url: str) -> str:
+def song_url(path: str) -> str:
+    """Absolute URL for a /song/<id>/<slug> path scraped off an album page."""
+    return f"{BASE}/{LOCALE}{path}"
+
+
+def album_url(album_id: str) -> str:
+    return f"{BASE}/{LOCALE}/album/{album_id}/x"
+
+
+def is_challenge(body: str) -> bool:
+    return CHALLENGE_RE.search(body) is not None
+
+
+def _fetch(url: str) -> str:
     req = urllib.request.Request(url, headers={
         "User-Agent": UA,
         "Accept": "*/*",
@@ -84,6 +104,21 @@ def _get(url: str) -> str:
     if resp.headers.get("Content-Encoding") == "gzip":
         raw = gzip.decompress(raw)
     return raw.decode("utf-8", errors="replace")
+
+
+def _get(url: str, retries: int = 3, backoff: float = 1.5) -> str:
+    """Fetch a page, rejecting the bot interstitial instead of parsing it as data.
+
+    The interstitial comes back with HTTP 200, so without this check a blocked
+    request silently looks like a track with zero Shazams.
+    """
+    for attempt in range(1, retries + 1):
+        body = _fetch(url)
+        if not is_challenge(body):
+            return body
+        if attempt < retries:
+            time.sleep(backoff * attempt)
+    raise ShazamError(f"Blocked by bot challenge after {retries} attempts: {url}")
 
 
 def _itunes(op: str, params: dict) -> dict:
@@ -128,7 +163,7 @@ def get_artist_albums(artist_id: str, country: str):
 
 def get_album_song_links(album_id: str):
     """Tracks on a Shazam album page: [(song_id, path), ...] (path carries the slug)."""
-    body = _get(f"{BASE}/album/{album_id}/x")
+    body = _get(album_url(album_id))
     songs: dict = {}
     for m in SONG_LINK_RE.finditer(body):
         sid = m.group(1)
@@ -137,9 +172,9 @@ def get_album_song_links(album_id: str):
     return list(songs.items())
 
 
-def get_song_count(song_id: str, path: str, album: str) -> Track:
+def get_song_count(song_id: str, path: str, album: str, **kw) -> Track:
     """Track title and Shazam count from its song page."""
-    body = _get(BASE + path)
+    body = _get(song_url(path), **kw)
     count = 0
     m = COUNT_RE.search(body)
     if m:

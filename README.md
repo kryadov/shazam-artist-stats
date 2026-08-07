@@ -44,6 +44,12 @@ fetched concurrently with a small thread pool.
 
 - Python 3.8+ (uses only the standard library — nothing to `pip install`)
 
+## Tests
+
+```bash
+python -m unittest test_shazam_stats -v   # offline, no network access
+```
+
 ## Usage
 
 ```bash
@@ -61,6 +67,14 @@ python shazam_stats.py --artist-id 1720235535 --limit 50
 
 # Quiet mode (no progress on stderr)
 python shazam_stats.py "Personal Animosity" -q
+```
+
+Ready-made launchers for PERSONAL ANIMOSITY (any extra arguments are passed
+through):
+
+```bash
+./personal-animosity.sh            # Linux/macOS/Git Bash
+personal-animosity.bat --json      # Windows (sets UTF-8 output for the console)
 ```
 
 ### Finding an artist id
@@ -102,6 +116,11 @@ It's the last number in a Shazam artist URL (the same id Apple uses):
 
 - **Unofficial source.** Counts come from the structure of shazam.com song
   pages. If Shazam changes its markup, the tool may need updating.
+- **Bot protection.** shazam.com serves a JavaScript "Client Challenge"
+  interstitial — with HTTP 200, so it looks like a normal page — on unprefixed
+  `/song/<id>/<slug>` paths. Pages are therefore requested under the
+  locale-prefixed `/en-US/...` path, and a challenge response is retried and
+  then reported as an error rather than parsed as a zero count.
 - **Coverage.** The discography is enumerated from the iTunes/Apple catalog
   for the artist id, so it includes albums, EPs, and singles — not just what
   the Shazam artist page happens to show. A track is counted only if it also
