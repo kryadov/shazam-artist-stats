@@ -27,7 +27,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from html import unescape
 from typing import Optional
 
@@ -43,8 +43,11 @@ UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
 
 # /song/<id>/<slug> links found on Shazam album pages.
 SONG_LINK_RE = re.compile(r'/song/(\d+)/([a-z0-9][a-z0-9-]*)')
-# Shazam count on a song page: <span class="...tagCountText...">123</span>
-COUNT_RE = re.compile(r'tagCountText[^"]*">\s*([\d,]+)\s*<')
+# Shazam count on a song page, next to the Shazam logo icon:
+#   <use xlink:href="#ShazamLogo"></use></svg><span>2,355,438</span>
+# Older builds used <span class="...tagCountText...">123</span>; still accepted.
+COUNT_RE = re.compile(r'#ShazamLogo"></use></svg><span>\s*([\d,]+)\s*<'
+                      r'|tagCountText[^"]*">\s*([\d,]+)\s*<')
 TITLE_RE = re.compile(r'<title>([^<]+)</title>', re.I)
 # The bot interstitial: a tiny JS-only page titled "Client Challenge", served with 200.
 CHALLENGE_RE = re.compile(r'<title>\s*Client Challenge\s*</title>', re.I)
@@ -69,6 +72,7 @@ class ArtistStats:
     total_shazams: int
     track_count: int
     tracks: list  # list[Track]
+    failed: list = field(default_factory=list)  # song paths that could not be fetched
 
 
 # --------------------------------------------------------------------------- #
@@ -92,7 +96,7 @@ def _fetch(url: str) -> str:
         "User-Agent": UA,
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, identity",
+        # No Accept-Encoding: shazam.com answers 404 to any request offering gzip.
     })
     try:
         resp = urllib.request.urlopen(req, timeout=30)
@@ -111,11 +115,19 @@ def _get(url: str, retries: int = 3, backoff: float = 1.5) -> str:
 
     The interstitial comes back with HTTP 200, so without this check a blocked
     request silently looks like a track with zero Shazams.
+
+    Shazam also returns sporadic 404s/5xx for valid pages under load, so HTTP and
+    network errors are retried too.
     """
     for attempt in range(1, retries + 1):
-        body = _fetch(url)
-        if not is_challenge(body):
-            return body
+        try:
+            body = _fetch(url)
+        except ShazamError:
+            if attempt == retries:
+                raise
+        else:
+            if not is_challenge(body):
+                return body
         if attempt < retries:
             time.sleep(backoff * attempt)
     raise ShazamError(f"Blocked by bot challenge after {retries} attempts: {url}")
@@ -178,7 +190,7 @@ def get_song_count(song_id: str, path: str, album: str, **kw) -> Track:
     count = 0
     m = COUNT_RE.search(body)
     if m:
-        count = int(m.group(1).replace(",", ""))
+        count = int((m.group(1) or m.group(2)).replace(",", ""))
     title = path.rsplit("/", 1)[-1].replace("-", " ").title()  # fallback from slug
     tm = TITLE_RE.search(body)
     if tm:
@@ -213,17 +225,32 @@ def collect_stats(artist_id: str, artist_name: str, country: str, limit: int,
     items = [(sid, path, album) for sid, (path, album) in songs.items()][:limit]
     progress(f"{len(items)} tracks. Fetching Shazam counts...")
 
+    def fetch(item):
+        try:
+            return get_song_count(*item)
+        except ShazamError as e:
+            progress(f"Warning: skipping track: {e}")
+            return None
+
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        tracks = list(pool.map(lambda s: get_song_count(*s), items))
+        results = list(pool.map(fetch, items))
+    tracks = [t for t in results if t is not None]
+    failed = [path for (_, path, _), t in zip(items, results) if t is None]
+    if not tracks:
+        raise ShazamError(f"Could not fetch any of {len(items)} tracks.")
 
     tracks.sort(key=lambda t: t.shazam_count, reverse=True)
     total = sum(t.shazam_count for t in tracks)
+    if total == 0 and len(tracks) > 1:
+        progress("Warning: every track parsed as 0 Shazams; the song-page markup "
+                 "may have changed (see COUNT_RE).")
     return ArtistStats(
         artist_id=str(artist_id),
         artist_name=artist_name,
         total_shazams=total,
         track_count=len(tracks),
         tracks=tracks,
+        failed=failed,
     )
 
 
@@ -240,8 +267,11 @@ def render_table(stats: ArtistStats) -> str:
     lines = [
         f"Artist: {stats.artist_name}  (id {stats.artist_id})",
         f"Total Shazams across {stats.track_count} tracks: {grp(stats.total_shazams)}",
-        "",
     ]
+    if stats.failed:
+        lines.append(f"Warning: {len(stats.failed)} track(s) could not be fetched "
+                     f"and are not counted: {', '.join(stats.failed)}")
+    lines.append("")
     title_w = min(40, max([len("Track")] + [len(t.title) for t in stats.tracks]))
     album_w = min(34, max([len("Album")] + [len(t.album) for t in stats.tracks]))
     cnt_w = max([len("Shazams")] + [len(grp(t.shazam_count)) for t in stats.tracks])
