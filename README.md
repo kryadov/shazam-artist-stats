@@ -7,13 +7,13 @@ from most to least Shazamed.
 ```
 $ python shazam_stats.py "Personal Animosity"
 Artist: PERSONAL ANIMOSITY  (id 1720235535)
-Total Shazams across 246 tracks: 7 540
+Total Shazams across 318 tracks: 8 678
 
   #  Track                          Album                            Shazams
 ---------------------------------------------------------------------------
-  1  bloody tears (for Julia) [fea… bloody tears (for Julia) [feat…     4 567
-  2  ENOUGH                         darkside of love - Single             521
-  3  страх                          страх - Single                        365
+  1  bloody tears (for Julia) [fea… bloody tears (for Julia) [feat…     4 611
+  2  ENOUGH                         darkside of love - Single             594
+  3  страх                          страх - Single                        389
   ...
 ```
 
@@ -34,11 +34,13 @@ public sources — no API key, no account, no paid service:
 2. **Walk the full discography** — iTunes lookup returns every release; each
    Shazam album page lists its tracks (and the slugs the song pages need).
 3. **Read each track's Shazam count** — every Shazam song page server-renders
-   its "tag count" (the number of Shazams).
+   its count next to the Shazam logo icon.
 4. **Aggregate** — sum the counts and sort tracks descending.
 
 All HTTP is plain `urllib` from the standard library; album and song pages are
-fetched concurrently with a small thread pool.
+fetched concurrently with a small thread pool. Failed requests are retried with
+backoff; a track that still can't be fetched is skipped and listed in the
+output (and in `failed` in the JSON), so the total is never silently short.
 
 ## Requirements
 
@@ -82,6 +84,12 @@ personal-animosity.bat --json      # Windows (sets UTF-8 output for the console)
 It's the last number in a Shazam artist URL (the same id Apple uses):
 `https://www.shazam.com/artist/personal-animosity/`**`1720235535`**
 
+One artist can have **several Apple artist profiles** with the same name — for
+example when a distributor files a release under a duplicate profile. A name
+search picks the first match and prints the others to stderr; run each with
+`--artist-id` and add the totals. PERSONAL ANIMOSITY, for instance, has
+*Time Rift (Volume 3)* under a separate profile, `1869261655`.
+
 ### Options
 
 | Option         | Description                                            |
@@ -99,23 +107,32 @@ It's the last number in a Shazam artist URL (the same id Apple uses):
 {
   "artist_id": "1720235535",
   "artist_name": "PERSONAL ANIMOSITY",
-  "total_shazams": 7540,
-  "track_count": 246,
+  "total_shazams": 8678,
+  "track_count": 318,
   "tracks": [
     {
-      "song_id": "1787392149",
+      "song_id": "1787392151",
       "title": "bloody tears (for Julia) [feat. BLAZER 993]",
       "album": "bloody tears (for Julia) [feat. BLAZER 993] - Single",
-      "shazam_count": 4567
+      "shazam_count": 4611
     }
-  ]
+  ],
+  "failed": []
 }
 ```
+
+`failed` lists the song paths that could not be fetched after retries; those
+tracks are not included in `tracks` or `total_shazams`.
 
 ## Notes & limitations
 
 - **Unofficial source.** Counts come from the structure of shazam.com song
-  pages. If Shazam changes its markup, the tool may need updating.
+  pages. If Shazam changes its markup, the tool may need updating. If every
+  track comes back as 0, the tool warns that the markup has probably changed.
+- **Quirks of shazam.com.** It answers `404` to any request that offers gzip
+  (so none is offered), and it sporadically returns `404`/`5xx` for valid
+  pages under load (so errors are retried). Tracks with no Shazams have no
+  count on their page and are reported as 0.
 - **Bot protection.** shazam.com serves a JavaScript "Client Challenge"
   interstitial — with HTTP 200, so it looks like a normal page — on unprefixed
   `/song/<id>/<slug>` paths. Pages are therefore requested under the
@@ -131,6 +148,12 @@ It's the last number in a Shazam artist URL (the same id Apple uses):
 - For official artist analytics, use
   [Apple Music for Artists](https://artists.apple.com/), which surfaces Shazam
   data for verified artists.
+
+## Roadmap
+
+- **YouTube views and likes** per track, from the official YouTube Data API
+  (needs a free API key), configured through a `.env` file. The agreed design
+  is recorded in [AGENTS.md](AGENTS.md#planned-youtube-statistics).
 
 ## Disclaimer
 
