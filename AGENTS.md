@@ -5,43 +5,60 @@ Guidance for coding agents working in this repository. User-facing docs live in
 
 ## Project
 
-`shazam_stats.py` is a single-file, **zero-dependency** Python CLI (stdlib only,
-Python 3.8+) that reports per-track Shazam counts for an artist:
+A **zero-dependency** Python CLI (stdlib only, Python 3.8+) that reports
+per-track Shazam counts and, optionally, YouTube views/likes for an artist:
 
 1. iTunes Search API resolves an artist name to an Apple artist id.
 2. iTunes Lookup API lists every release (albums, EPs, singles) of that id.
 3. Each Shazam album page (`/en-US/album/<id>/x`) lists its tracks as
    `/song/<id>/<slug>` links.
 4. Each Shazam song page server-renders the track's Shazam count.
+5. YouTube (optional): the official Data API v3 lists every upload of the
+   artist's "`<artist> - Topic`" channel(s) with views/likes; videos are
+   matched to catalog tracks by normalized title.
 
+The input stays an artist name or `--artist-id`; everything else is derived.
 `personal-animosity.bat` / `.sh` are launchers for artist id `1720235535` that
-pass extra arguments through.
+pin its two Topic channels and pass extra arguments through.
 
 ## Commands
 
 ```bash
-python -m unittest test_shazam_stats -v        # offline tests, no network
+python -m unittest -v                           # all offline tests, no network
 python shazam_stats.py "Personal Animosity"     # real run (~1 min, ~380 requests)
 python shazam_stats.py --artist-id 1720235535 --limit 20   # quick real check
+python shazam_stats.py --artist-id 1720235535 --sources youtube  # YouTube only
 ```
 
 Run the offline tests after every change. Do a real run (a small `--limit` is
 enough) after touching HTTP code or parsing, because the tests can't catch
-changes on shazam.com.
+changes on shazam.com or in the API. YouTube runs need `YOUTUBE_API_KEY` in
+`.env`; never print or commit it.
 
-## Code map (`shazam_stats.py`)
+## Code map
 
-| Area | What lives there |
+| File / area | What lives there |
 | --- | --- |
-| Constants / regexes | `UA`, `SONG_LINK_RE`, `COUNT_RE`, `TITLE_RE`, `CHALLENGE_RE` |
-| Data model | `Track`, `ArtistStats` (`failed` = song paths skipped after retries) |
-| HTTP | `_fetch` (one request), `_get` (retries + challenge detection), `_itunes` |
-| Pipeline | `search_artist`, `get_artist_albums`, `get_album_song_links`, `get_song_count`, `collect_stats` |
-| Output | `render_table`, `render_json` |
-| CLI | `main` |
+| `shazam_stats.py` constants | `UA`, `SONG_LINK_RE`, `COUNT_RE`, `TITLE_RE`, `CHALLENGE_RE` |
+| `shazam_stats.py` data model | `Track`, `ArtistStats` (`failed` = song paths skipped after retries; `None` = source not collected) |
+| `shazam_stats.py` HTTP | `_fetch` (one request), `_get` (retries + challenge detection), `_itunes` |
+| `shazam_stats.py` pipeline | `search_artist`, `get_artist_albums`, `get_itunes_tracks`, `get_album_song_links`, `get_song_count`, `collect_stats` |
+| `shazam_stats.py` YouTube glue | `resolve_youtube_channels`, `add_youtube`, `sort_tracks` |
+| `shazam_stats.py` output / CLI | `render_table`, `render_json`, `main` |
+| `config.py` | `.env` parser, `SOURCES` / `YOUTUBE_API_KEY` resolution (`load_config`) |
+| `youtube.py` | `Client` (API calls, retries, quota counter), `redact`, `ApiError` hints |
+| `matching.py` | `normalize`, `match_videos` (pure functions) |
 
-Every expected failure raises `ShazamError`. `main` catches it and exits with
-code 1. Progress and warnings go to **stderr**, results to **stdout**.
+Expected failures raise `ShazamError`, `ConfigError` or `YouTubeError`. `main`
+catches them and exits with code 1. Progress and warnings go to **stderr**,
+results to **stdout**.
+
+**Run order in `main`:** config (no network) → artist → iTunes catalog →
+resolve YouTube channels (fails fast on a bad key or quota) → Shazam → YouTube
+uploads/stats → match → sort → render. If YouTube fails after Shazam
+succeeded, print the Shazam results and a warning. `collect_stats` returns
+tracks in **catalog order**; matching relies on it ("first row wins"), so sort
+only at the end.
 
 ## shazam.com quirks (learned the hard way)
 
@@ -62,127 +79,52 @@ code 1. Progress and warnings go to **stderr**, results to **stdout**.
   parses as 0, `collect_stats` warns that the markup has probably changed. Find
   the new form by fetching a popular track (e.g. one from
   `/en-US/charts/top-200/world`) and searching around `ShazamLogo`.
+- **Lossy titles.** The song page `<title>` drops version suffixes
+  ("NN (MIXED)" reads "NN"). When YouTube is collected, `add_youtube` replaces
+  titles with iTunes track names (same Apple song ids) before matching.
 - **Duplicate artist profiles.** One artist can have several Apple artist ids
   with the same name (for PERSONAL ANIMOSITY, `1869261655` holds only
   *Time Rift (Volume 3)*). The name search picks the first match and prints
   the others.
 
+## YouTube quirks (verified 2026-10-17)
+
+- **Topic uploads playlist is complete.** For PERSONAL ANIMOSITY,
+  `UUW0XqjvAVf_zimSmZ9MzTaA` lists 321 videos for ~319 catalog tracks.
+  `statistics.videoCount` on Topic channels says 0; don't rely on it.
+- **Duplicate Topic channels.** The artist has two channels titled
+  "PERSONAL ANIMOSITY - Topic": `UCW0XqjvAVf_zimSmZ9MzTaA` (all uploads) and
+  `UCExcanjCPOj2O8CKzHas8Fg` (none). The search keeps every exact-title match.
+  An empty channel's uploads playlist answers `404 playlistNotFound`, which
+  `list_uploads` treats as empty.
+- **Topic video titles are the bare track names** (no artist prefix), so the
+  artist prefix is stripped only from official-channel videos.
+- The *Time Rift (Volume 3)* tracks (other Apple profile) are on the main
+  Topic channel, so they appear as unmatched videos for `1720235535`. That is
+  expected.
+- An invalid key returns `400` with reason `badRequest` and
+  `details[].reason = API_KEY_INVALID`; quota/API errors are `403`. 4xx is not
+  retried; 5xx and network errors are.
+- Don't use per-track `search.list` (100 units each). A full run is ~16 units
+  with pinned channels, ~116 with the Topic search.
+
 ## Conventions
 
-- **Stdlib only.** Don't add third-party dependencies. If a `.env` file is
-  needed, parse it in a few lines; don't use `python-dotenv`.
+- **Stdlib only.** Don't add third-party dependencies (the `.env` parser is in
+  `config.py`; don't use `python-dotenv`).
 - **Tests are offline.** Mock `_fetch` / pipeline functions with
-  `unittest.mock`. Test fixtures copy the *shape* of real pages; hashed CSS
+  `unittest.mock`. Tests of `main` must mock `load_config` so they never read
+  the real `.env`. Test fixtures copy the *shape* of real pages; hashed CSS
   class suffixes change per build, so never match on them.
-- **Don't fail silently.** Bot challenges, markup changes and skipped tracks
-  must be visible (error or warning), never a quiet 0.
+- **Don't fail silently.** Bot challenges, markup changes, skipped tracks and
+  unmatched videos must be visible (error or warning), never a quiet 0.
+- **Exact title matching only.** No fuzzy matching: a wrong match is worse
+  than a miss.
+- **Never leak the API key.** Pass every URL through `youtube.redact` before it
+  reaches an error or log. `.env` is git-ignored.
 - **Be polite to shazam.com.** Keep the default concurrency (8 workers) and
   backoff.
 - Match the existing style: small functions, `# ---` section banners,
   comments that explain *why*.
 - The user often writes in Russian. Answer in the language they use. Code,
   comments, commits and docs stay in English.
-
-## Planned: YouTube statistics
-
-Agreed with the user (2026-10-13) but **not implemented yet**. Implement it
-following this design unless the user changes it.
-
-**Goal.** Next to Shazam, show YouTube **views and likes** per track and in
-total for the same artist catalog.
-
-**Configuration (`.env` + flags).**
-- Commit a `.env.example`; add `.env` to `.gitignore`.
-  ```ini
-  SOURCES=shazam,youtube   # what to collect: shazam, youtube, or both
-  YOUTUBE_API_KEY=
-  ```
-- Precedence: CLI flag → real environment → `.env` (next to the script) →
-  default. The default for `SOURCES` is `shazam`, plus `youtube` if a key is
-  set. `--sources` overrides it; `--no-youtube` is shorthand for
-  `--sources shazam`.
-- If `youtube` is requested explicitly without a key, fail with a clear
-  message before any network request.
-- If `SOURCES=youtube`, still enumerate the catalog via iTunes but skip the
-  shazam.com page fetches.
-- Channels are per artist, so they go in flags (and the launchers), not in
-  `.env`. `--youtube-topic-channel` overrides the automatic search for
-  "`<artist> - Topic`" (one `search.list`, 100 quota units).
-  `--youtube-channel` (channel id or `@handle`) adds the official channel.
-
-**Data source.** Use the official YouTube Data API v3 only; no scraping.
-1. `channels.list` gets each channel's uploads playlist.
-2. `playlistItems.list` lists all uploads, 50 per page.
-3. `videos.list` gets `viewCount` / `likeCount`, 50 ids per call.
-
-A full catalog costs about 20 units plus 100 for the Topic search, out of a
-10,000/day quota. **Don't use per-track `search.list`**: 100 units × 300+
-tracks exceeds the daily quota.
-
-**Risk to check first.** For auto-generated Topic channels, the uploads
-playlist can be incomplete or empty. Check this with a real key before
-building on it. The fallback is the Topic channel's album playlists
-(`playlists.list`).
-
-**Matching (pure functions, `matching.py`).**
-- Normalize titles the same way on both sides:
-  - NFKC + `casefold` (so Cyrillic titles compare correctly);
-  - drop `(feat. …)`, `[feat. …]`, `ft.`, `- Remastered`, `(Official Video)`,
-    `(Lyrics)` and `| …` suffixes;
-  - for official-channel videos, strip a leading `<Artist> - ` prefix;
-  - collapse punctuation and whitespace.
-- Match only on **exact** normalized titles. Don't use fuzzy matching: a wrong
-  match is worse than a miss, and misses show up as unmatched videos.
-- A track can collect several videos (Art Tracks from a single and an album,
-  a music video, a lyric video). Sum their views and likes.
-- When several catalog rows share a normalized title, the videos go to the
-  first row, like Shazam's "first album wins". This keeps totals from being
-  double-counted.
-- Hidden likes (`likeCount` missing) count as 0, with a note in the summary.
-
-**Data model / output.**
-- `Track` gains `youtube_views`, `youtube_likes` and `youtube_videos`
-  (list of ids). `None` means "YouTube not collected"; `0` means "collected,
-  no video found".
-- `ArtistStats` gains `total_youtube_views`, `total_youtube_likes`, the
-  resolved channels and `unmatched_videos` (title + views).
-- The table shows columns only for enabled sources, with `—` for tracks
-  without a video. Add a summary line, e.g.
-  `YouTube (<Topic channel>): N views, M likes, 290/318 tracks matched`, and
-  list unmatched videos at the end.
-- Sort by the first source in `SOURCES`; `--sort shazam|views|likes`
-  overrides it.
-- JSON carries the same fields. `shazam_count` stays and is `null` in
-  youtube-only mode.
-
-**Modules.** `shazam_stats.py` stays the entry point and keeps the Shazam
-code. Add:
-- `config.py`: `.env` parser, `SOURCES` resolution and validation;
-- `youtube.py`: API client, channel/handle resolution, uploads, statistics;
-- `matching.py`: normalization and matching.
-
-**Run order.** Validate config and resolve YouTube channels first, so a bad
-key or exhausted quota fails fast. Then collect Shazam, then YouTube videos
-and stats, then match and render.
-
-**Errors.**
-- On API `403` (`keyInvalid`, `quotaExceeded`, `accessNotConfigured`), show a
-  clear message with a hint (e.g. "enable YouTube Data API v3"), without
-  retrying.
-- Retry `5xx` and network errors with backoff.
-- If the Topic channel isn't found, warn and suggest `--youtube-topic-channel`.
-- If YouTube fails after Shazam succeeded, still print the Shazam results and
-  a warning.
-- **Strip `key=` from any URL** before it appears in an error or log.
-
-**Tests (offline).**
-- Normalization table: feat., Cyrillic, video suffixes, artist prefix.
-- Matching: multiple videos per track, duplicate catalog titles, unmatched
-  videos.
-- `.env` parsing: comments, quotes, precedence; missing-key error.
-- Fake API JSON: pagination, missing `likeCount`, `403 quotaExceeded`, key
-  redaction.
-- Table columns per `SOURCES`, and `--sort`.
-
-Update README (setup of the API key, new options, JSON fields) and the
-launchers when this lands.

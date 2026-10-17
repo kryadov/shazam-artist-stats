@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Offline tests for shazam_stats — no network access required."""
 
+import io
+import json
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 import shazam_stats as s
+import youtube as yt
+from config import Config, ConfigError
 
 # Shortened copy of the F5/Shape interstitial shazam.com serves with HTTP 200.
 CHALLENGE_HTML = (
@@ -111,6 +116,222 @@ class Parsing(unittest.TestCase):
         with mock.patch.object(s, "_fetch", return_value=LEGACY_SONG_HTML):
             track = s.get_song_count("1", "/song/1/x", "Album")
         self.assertEqual(track.shazam_count, 32_221_476)
+
+
+# --------------------------------------------------------------------------- #
+# YouTube integration
+# --------------------------------------------------------------------------- #
+def make_stats(sources=("shazam",)):
+    # Catalog order; "ENOUGH" appears on two releases.
+    tracks = [s.Track("1", "ENOUGH", "darkside of love - Single", 594),
+              s.Track("2", "страх", "страх - Single", 389),
+              s.Track("3", "ENOUGH", "Compilation", 5)]
+    return s.ArtistStats("1720235535", "PERSONAL ANIMOSITY", 988, 3, tracks,
+                         sources=list(sources))
+
+
+def topic_video(vid, title, views, likes):
+    return yt.Video(vid, title, "UCW0XqjvAVf_zimSmZ9MzTaA", views, likes)
+
+
+TOPIC = yt.Channel("UCW0XqjvAVf_zimSmZ9MzTaA", "PERSONAL ANIMOSITY - Topic",
+                   "UUW0XqjvAVf_zimSmZ9MzTaA")
+
+
+def table_header(out):
+    return next(line for line in out.splitlines() if line.lstrip().startswith("#"))
+
+
+class AddYouTube(unittest.TestCase):
+    def setUp(self):
+        self.stats = make_stats(("shazam", "youtube"))
+        client = mock.Mock(units=16)
+        client.collect_videos.return_value = [
+            topic_video("a", "ENOUGH", 1000, 20),    # Art Track from the single
+            topic_video("b", "ENOUGH", 83, None),    # same track, likes hidden
+            topic_video("c", "Garden Party", 6, 0),  # from another artist profile
+        ]
+        s.add_youtube(self.stats, client, [TOPIC], verbose=False)
+
+    def test_videos_are_summed_on_first_duplicate_row(self):
+        first, scary, dup = self.stats.tracks
+        self.assertEqual((first.youtube_views, first.youtube_likes), (1083, 20))
+        self.assertEqual(first.youtube_videos, ["a", "b"])
+        self.assertEqual((scary.youtube_views, scary.youtube_videos), (0, []))
+        self.assertEqual(dup.youtube_videos, [])
+
+    def test_totals_and_unmatched(self):
+        st = self.stats
+        self.assertEqual((st.total_youtube_views, st.total_youtube_likes), (1083, 20))
+        self.assertEqual(st.youtube_tracks_matched, 1)
+        self.assertEqual(st.youtube_hidden_likes, 1)
+        self.assertEqual(st.unmatched_videos,
+                         [{"id": "c", "title": "Garden Party", "views": 6}])
+        self.assertEqual(st.youtube_channels[0]["title"], "PERSONAL ANIMOSITY - Topic")
+
+    def test_table_has_shazam_and_youtube_columns(self):
+        out = s.render_table(self.stats)
+        header = table_header(out)
+        self.assertIn("Shazams", header)
+        self.assertIn("YouTube (views / likes)", header)
+        self.assertIn("1 083 / 20", out)
+        self.assertIn("—", out)
+        self.assertIn("YouTube (PERSONAL ANIMOSITY - Topic): 1 083 views, 20 likes, "
+                      "1/3 tracks matched", out)
+        self.assertIn("hide their likes", out)
+        self.assertIn("Unmatched YouTube videos (1", out)
+        self.assertIn("Garden Party", out)
+
+    def test_itunes_titles_replace_lossy_shazam_titles(self):
+        st = make_stats(("shazam", "youtube"))
+        st.tracks[1].title = "NN"  # Shazam's page title for "NN (MIXED)"
+        client = mock.Mock(units=1)
+        client.collect_videos.return_value = [topic_video("m", "NN (MIXED)", 295, 3)]
+        s.add_youtube(st, client, [TOPIC], verbose=False, titles={"2": "NN (MIXED)"})
+        self.assertEqual(st.tracks[1].title, "NN (MIXED)")
+        self.assertEqual(st.tracks[1].youtube_videos, ["m"])
+        self.assertEqual(st.tracks[0].title, "ENOUGH")  # not in the map: kept
+
+    def test_json_fields(self):
+        data = json.loads(s.render_json(self.stats))
+        self.assertEqual(data["total_youtube_views"], 1083)
+        self.assertEqual(data["tracks"][0]["youtube_videos"], ["a", "b"])
+        self.assertEqual(data["tracks"][0]["shazam_count"], 594)
+
+
+class TableColumns(unittest.TestCase):
+    def test_shazam_only(self):
+        out = s.render_table(make_stats(("shazam",)))
+        self.assertIn("Shazams", table_header(out))
+        self.assertNotIn("YouTube", out)
+
+    def test_youtube_only(self):
+        st = make_stats(("youtube",))
+        st.total_shazams = None
+        for t in st.tracks:
+            t.shazam_count = None
+            t.youtube_views, t.youtube_likes, t.youtube_videos = 5, 1, ["x"]
+        st.total_youtube_views = st.total_youtube_likes = 0
+        st.youtube_tracks_matched = 3
+        out = s.render_table(st)
+        self.assertNotIn("Shazams", table_header(out))
+        self.assertIn("YouTube (views / likes)", table_header(out))
+        self.assertIn("Tracks: 3", out)
+
+    def test_long_unmatched_list_is_truncated(self):
+        st = make_stats(("shazam", "youtube"))
+        st.total_youtube_views = st.total_youtube_likes = st.youtube_tracks_matched = 0
+        st.unmatched_videos = [{"id": str(i), "title": f"V{i}", "views": 1}
+                               for i in range(s.UNMATCHED_SHOWN + 5)]
+        self.assertIn("... and 5 more", s.render_table(st))
+
+
+class Sorting(unittest.TestCase):
+    def stats(self):
+        st = make_stats(("shazam", "youtube"))
+        for t, (views, likes) in zip(st.tracks, [(10, 9), (500, 1), (0, 0)]):
+            t.youtube_views, t.youtube_likes = views, likes
+        return st
+
+    def test_sort_by_each_key(self):
+        for key, expected in [("shazam", ["1", "2", "3"]), ("views", ["2", "1", "3"]),
+                              ("likes", ["1", "2", "3"])]:
+            st = self.stats()
+            s.sort_tracks(st, key)
+            self.assertEqual([t.song_id for t in st.tracks], expected, key)
+
+    def test_uncollected_sorts_last(self):
+        st = self.stats()
+        st.tracks[0].youtube_views = None
+        s.sort_tracks(st, "views")
+        self.assertEqual(st.tracks[-1].song_id, "1")
+
+
+class ItunesTracks(unittest.TestCase):
+    def test_tracks_from_lookup_first_album_wins(self):
+        data = {"results": [
+            {"wrapperType": "collection", "collectionId": 2},
+            {"wrapperType": "track", "collectionId": 2, "trackId": 11,
+             "trackName": "Tape and Neon", "trackNumber": 1},
+            {"wrapperType": "track", "collectionId": 1, "trackId": 11,
+             "trackName": "Tape and Neon", "trackNumber": 3},
+            {"wrapperType": "track", "collectionId": 1, "trackId": 12,
+             "trackName": "Our youth", "trackNumber": 1},
+        ]}
+        with mock.patch.object(s, "_itunes", return_value=data):
+            tracks = s.get_itunes_tracks([("1", "dcw"), ("2", "Junior Forever")], "us")
+        self.assertEqual(tracks, [("12", "Our youth", "dcw"),
+                                  ("11", "Tape and Neon", "dcw")])
+
+
+class MainFlow(unittest.TestCase):
+    """main() with every network step mocked; never reads the real .env."""
+
+    CATALOG = ("PERSONAL ANIMOSITY", [("9", "darkside of love - Single")])
+
+    def run_main(self, cfg, argv=(), collect_videos=None):
+        client = mock.Mock(units=1)
+        client.collect_videos.side_effect = collect_videos or (
+            lambda channels: [topic_video("a", "ENOUGH", 1000, 20)])
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(s, "load_config", return_value=cfg), \
+             mock.patch.object(s, "get_artist_albums", return_value=self.CATALOG), \
+             mock.patch.object(s, "get_album_song_links",
+                               return_value=[("1", "/song/1/enough")]) as links, \
+             mock.patch.object(s, "get_song_count",
+                               return_value=s.Track("1", "ENOUGH", "darkside", 594)), \
+             mock.patch.object(s, "get_itunes_tracks",
+                               return_value=[("1", "ENOUGH", "darkside")]), \
+             mock.patch.object(yt, "Client", return_value=client), \
+             mock.patch.object(s, "resolve_youtube_channels", return_value=[TOPIC]), \
+             redirect_stdout(out), redirect_stderr(err):
+            code = s.main(["--artist-id", "1720235535", "-q", *argv])
+        return code, out.getvalue(), err.getvalue(), links
+
+    def test_both_sources(self):
+        code, out, _, _ = self.run_main(Config(["shazam", "youtube"], "k"))
+        self.assertEqual(code, 0)
+        self.assertIn("594", out)
+        self.assertIn("1 000 / 20", out)
+
+    def test_youtube_only_skips_shazam_pages(self):
+        code, out, _, links = self.run_main(Config(["youtube"], "k"))
+        self.assertEqual(code, 0)
+        links.assert_not_called()
+        self.assertNotIn("Shazams", out)
+        self.assertIn("1 000 / 20", out)
+
+    def test_youtube_failure_keeps_shazam_results(self):
+        def boom(channels):
+            raise yt.YouTubeError("YouTube API HTTP 403 (quotaExceeded)")
+        code, out, err, _ = self.run_main(Config(["shazam", "youtube"], "k"),
+                                          collect_videos=boom)
+        self.assertEqual(code, 0)
+        self.assertIn("Shazams", out)
+        self.assertNotIn("YouTube", out)
+        self.assertIn("YouTube statistics skipped", err)
+
+    def test_youtube_only_failure_is_an_error(self):
+        def boom(channels):
+            raise yt.YouTubeError("quotaExceeded")
+        code, _, err, _ = self.run_main(Config(["youtube"], "k"), collect_videos=boom)
+        self.assertEqual(code, 1)
+        self.assertIn("quotaExceeded", err)
+
+    def test_config_error_before_any_request(self):
+        err = io.StringIO()
+        with mock.patch.object(s, "load_config", side_effect=ConfigError("no key")), \
+             mock.patch.object(s, "get_artist_albums") as albums, redirect_stderr(err):
+            code = s.main(["--artist-id", "1", "--sources", "youtube"])
+        self.assertEqual(code, 1)
+        albums.assert_not_called()
+        self.assertIn("no key", err.getvalue())
+
+    def test_sort_flag_needs_its_source(self):
+        with mock.patch.object(s, "load_config", return_value=Config(["shazam"])), \
+             redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                s.main(["--artist-id", "1", "--sort", "views"])
 
 
 if __name__ == "__main__":
